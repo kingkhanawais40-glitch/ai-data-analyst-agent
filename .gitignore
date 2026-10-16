@@ -1,0 +1,40 @@
+﻿# Python virtual environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+
+# Local database and uploaded datasets
+database/*.db
+database/*.sqlite
+database/*.sqlite3
+backend/uploads/
+data/*
+!data/.gitkeep
+
+# Generated PDF reports
+reports/*.pdf
+dataset_*_report.pdf
+
+# Logs and editor files
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
