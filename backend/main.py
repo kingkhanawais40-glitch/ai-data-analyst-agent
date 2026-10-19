@@ -66,7 +66,13 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 UPLOAD_DIR = BASE_DIR / "backend" / "uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Vercel's deployment filesystem is read-only.
+# Create the uploads directory only during local development.
+if os.getenv("VERCEL") != "1":
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
 
 def load_dataset_dataframe(dataset):
     """
