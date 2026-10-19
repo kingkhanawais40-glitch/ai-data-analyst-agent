@@ -16,9 +16,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 DATABASE_DIR = BASE_DIR / "database"
-DATABASE_DIR.mkdir(exist_ok=True)
-
 DATABASE_PATH = DATABASE_DIR / "bi_agent.db"
+
+# Vercel deployment filesystem is read-only.
+# Create the SQLite directory only for local development.
+if os.getenv("VERCEL") != "1":
+    DATABASE_DIR.mkdir(parents=True, exist_ok=True)
 
 # SQLite remains the default for local development and tests.
 # Set DATABASE_BACKEND=postgres in the production environment.
