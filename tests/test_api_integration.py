@@ -186,10 +186,10 @@ def test_execute_endpoint_returns_successful_execution(monkeypatch):
     )
 
     monkeypatch.setattr(
-        main_module.Path,
-        "exists",
-        lambda self: True,
-    )
+    main_module.Path,
+    "is_file",
+    lambda self: True,
+)
 
     monkeypatch.setattr(
         main_module.pd,
@@ -325,10 +325,11 @@ def test_execute_endpoint_preserves_partial_failure(monkeypatch):
         __import__("pathlib").Path("fake_test_uploads"),
     )
     monkeypatch.setattr(
-        main_module.Path,
-        "exists",
-        lambda self: True,
-    )
+    main_module.Path,
+    "is_file",
+    lambda self: True,
+)
+
     monkeypatch.setattr(
         main_module.pd,
         "read_csv",

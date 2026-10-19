@@ -1,5 +1,14 @@
 from pathlib import Path
 import shutil
+import io
+import base64
+import hashlib
+import hmac
+import json
+import os
+import time
+
+
 
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -19,6 +28,11 @@ from backend.business_questions import answer_business_question
 from backend.analysis_planner import plan_analysis
 from backend.agent_executor import execute_analysis_plan
 from backend.pdf_report import generate_pdf_report
+from backend.blob_storage import (
+    delete_blob_object,
+    download_blob_bytes,
+    upload_blob_bytes,
+)
 
 
 # ============================================================
@@ -31,11 +45,13 @@ app = FastAPI(
     version="1.0.0",
 )
 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://ai-data-analyst-agent-sand.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -51,6 +67,50 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 UPLOAD_DIR = BASE_DIR / "backend" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+def load_dataset_dataframe(dataset):
+    """
+    Load a dataset from private Vercel Blob or the legacy local
+    uploads directory.
+    """
+    blob_pathname = None
+
+    try:
+        blob_pathname = dataset["blob_pathname"]
+    except (KeyError, IndexError, TypeError):
+        pass
+
+    if blob_pathname:
+        try:
+            file_content = download_blob_bytes(blob_pathname)
+        except Exception as error:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unable to retrieve dataset from Blob storage: {error}",
+            ) from error
+
+        source = io.BytesIO(file_content)
+    else:
+        source = UPLOAD_DIR / dataset["file_name"]
+
+        if not source.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail="Dataset file not found.",
+            )
+
+    file_type = dataset["file_type"]
+
+    if file_type == "csv":
+        return pd.read_csv(source)
+
+    if file_type in {"xlsx", "xls"}:
+        return pd.read_excel(source)
+
+    raise HTTPException(
+        status_code=400,
+        detail="Unsupported dataset file type.",
+    )
 
 
 # ============================================================
@@ -85,6 +145,7 @@ def root():
 # HEALTH CHECK
 # ============================================================
 
+
 @app.get("/health")
 def health_check():
     return {
@@ -92,9 +153,186 @@ def health_check():
     }
 
 
+def verify_upload_registration_token(request: "BlobRegistrationRequest") -> bool:
+    secret = os.getenv("UPLOAD_REGISTRATION_SECRET")
+
+    if not secret or len(secret) < 32:
+        return False
+
+    try:
+        encoded_payload, supplied_signature = request.registrationToken.split(".", 1)
+
+        expected_signature = hmac.new(
+            secret.encode("utf-8"),
+            encoded_payload.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+
+        supplied_signature_bytes = base64.urlsafe_b64decode(
+            supplied_signature + "=" * (-len(supplied_signature) % 4)
+        )
+
+        if not hmac.compare_digest(expected_signature, supplied_signature_bytes):
+            return False
+
+        payload_bytes = base64.urlsafe_b64decode(
+            encoded_payload + "=" * (-len(encoded_payload) % 4)
+        )
+        payload = json.loads(payload_bytes.decode("utf-8"))
+
+        expires_at = payload.get("expiresAt")
+
+        if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+            return False
+
+        if expires_at <= int(time.time() * 1000):
+            return False
+
+        return (
+            payload.get("pathname") == request.pathname
+            and payload.get("fileName") == request.fileName
+            and payload.get("fileSize") == request.fileSize
+            and payload.get("contentType") == request.contentType
+        )
+
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+        return False
+
+
+class BlobRegistrationRequest(BaseModel):
+    pathname: str
+    fileName: str
+    fileSize: int
+    contentType: str
+    registrationToken: str
+
+
+
+
+@app.post("/upload/register")
+def register_blob_dataset(request: BlobRegistrationRequest):
+    if not verify_upload_registration_token(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid or expired upload registration token.",
+        )
+    original_name = Path(request.fileName).name
+    extension = Path(original_name).suffix.lower()
+
+    allowed_extensions = {
+        ".csv": "csv",
+        ".xlsx": "xlsx",
+        ".xls": "xls",
+    }
+
+    if extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Only CSV, XLSX, and XLS files are supported.",
+        )
+
+    if (
+        not request.pathname.startswith("datasets/uploads/")
+        or ".." in request.pathname
+        or "\\" in request.pathname
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid uploaded file reference.",
+        )
+
+    if request.fileSize <= 0 or request.fileSize > 25 * 1024 * 1024:
+        raise HTTPException(
+            status_code=400,
+            detail="File size must be between 1 byte and 25 MB.",
+        )
+
+    content_types = {
+        "csv": "text/csv",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xls": "application/vnd.ms-excel",
+    }
+    file_type = allowed_extensions[extension]
+
+    if request.contentType != content_types[file_type]:
+        raise HTTPException(
+            status_code=400,
+            detail="File type does not match the filename extension.",
+        )
+
+    connection = None
+
+    try:
+        file_content = download_blob_bytes(request.pathname)
+
+        if not file_content or len(file_content) != request.fileSize:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file size could not be verified.",
+            )
+
+        source = io.BytesIO(file_content)
+        if file_type == "csv":
+            dataframe = pd.read_csv(source)
+        else:
+            dataframe = pd.read_excel(source)
+
+        row_count = int(dataframe.shape[0])
+        column_count = int(dataframe.shape[1])
+
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO datasets (
+                name, file_name, file_type,
+                row_count, column_count, blob_pathname
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                Path(original_name).stem,
+                original_name,
+                file_type,
+                row_count,
+                column_count,
+                request.pathname,
+            ),
+        )
+
+        dataset_id = cursor.lastrowid
+        connection.commit()
+
+        return {
+            "message": "Dataset uploaded successfully.",
+            "dataset_id": dataset_id,
+            "file_name": original_name,
+            "file_type": file_type,
+            "rows": row_count,
+            "columns": column_count,
+            "column_names": dataframe.columns.tolist(),
+        }
+
+    except HTTPException:
+        if connection is not None:
+            connection.rollback()
+        raise
+    except Exception as error:
+        if connection is not None:
+            connection.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Dataset registration failed. Check the backend logs.",
+        ) from error
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 # ============================================================
 # UPLOAD DATASET
 # ============================================================
+
 
 @app.post("/upload")
 async def upload_dataset(
@@ -106,7 +344,7 @@ async def upload_dataset(
             detail="No file provided.",
         )
 
-    original_name = file.filename
+    original_name = Path(file.filename).name
     extension = Path(original_name).suffix.lower()
 
     allowed_extensions = {
@@ -123,64 +361,73 @@ async def upload_dataset(
 
     file_type = allowed_extensions[extension]
 
-    file_path = UPLOAD_DIR / original_name
+    content_types = {
+        "csv": "text/csv",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xls": "application/vnd.ms-excel",
+    }
+
+    blob_pathname = None
+    connection = None
 
     try:
-        with file_path.open("wb") as buffer:
-            shutil.copyfileobj(
-                file.file,
-                buffer,
+        # Read uploaded file into memory.
+        file_content = await file.read()
+
+        if not file_content:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file is empty.",
             )
 
-        # ----------------------------------------------------
-        # Read uploaded file
-        # ----------------------------------------------------
+        # Validate and inspect the file before uploading it.
+        source = io.BytesIO(file_content)
 
         if file_type == "csv":
-            dataframe = pd.read_csv(file_path)
+            dataframe = pd.read_csv(source)
         else:
-            dataframe = pd.read_excel(file_path)
+            dataframe = pd.read_excel(source)
 
         row_count = int(dataframe.shape[0])
         column_count = int(dataframe.shape[1])
 
-        # ----------------------------------------------------
-        # Save dataset metadata
-        # ----------------------------------------------------
+        # Store the actual dataset in private Vercel Blob.
+        blob_pathname = upload_blob_bytes(
+            pathname=f"datasets/{original_name}",
+            content=file_content,
+            content_type=content_types[file_type],
+        )
 
+        # Store metadata and the Blob pathname in the database.
         connection = get_connection()
 
-        try:
-            cursor = connection.cursor()
+        cursor = connection.cursor()
+        dataset_name = Path(original_name).stem
 
-            dataset_name = Path(original_name).stem
-
-            cursor.execute(
-                """
-                INSERT INTO datasets (
-                    name,
-                    file_name,
-                    file_type,
-                    row_count,
-                    column_count
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    dataset_name,
-                    original_name,
-                    file_type,
-                    row_count,
-                    column_count,
-                ),
+        cursor.execute(
+            """
+            INSERT INTO datasets (
+                name,
+                file_name,
+                file_type,
+                row_count,
+                column_count,
+                blob_pathname
             )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                dataset_name,
+                original_name,
+                file_type,
+                row_count,
+                column_count,
+                blob_pathname,
+            ),
+        )
 
-            dataset_id = cursor.lastrowid
-
-            connection.commit()
-
-        finally:
-            connection.close()
+        dataset_id = cursor.lastrowid
+        connection.commit()
 
         return {
             "message": "Dataset uploaded successfully.",
@@ -193,17 +440,36 @@ async def upload_dataset(
         }
 
     except HTTPException:
+        if blob_pathname:
+            try:
+                delete_blob_object(blob_pathname)
+            except Exception:
+                pass
         raise
 
     except Exception as error:
-        if file_path.exists():
-            file_path.unlink()
+        if connection is not None:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+
+        if blob_pathname:
+            try:
+                delete_blob_object(blob_pathname)
+            except Exception:
+                pass
 
         raise HTTPException(
             status_code=500,
             detail=f"Dataset upload failed: {str(error)}",
-        )
+        ) from error
 
+    finally:
+        if connection is not None:
+            connection.close()
+
+        await file.close()
 
 # ============================================================
 # GET DATASET PROFILE
@@ -235,25 +501,7 @@ def get_dataset_profile(
                 detail="Dataset not found.",
             )
 
-        file_path = UPLOAD_DIR / dataset["file_name"]
-
-        if not file_path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail="Dataset file not found.",
-            )
-
-        if dataset["file_type"] == "csv":
-            dataframe = pd.read_csv(file_path)
-
-        elif dataset["file_type"] in {"xlsx", "xls"}:
-            dataframe = pd.read_excel(file_path)
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type.",
-            )
+        dataframe = load_dataset_dataframe(dataset)
 
         profile = profile_dataframe(dataframe)
 
@@ -305,30 +553,11 @@ def validate_dataset(dataset_id: int):
                 detail="Dataset not found.",
             )
 
-        file_path = UPLOAD_DIR / dataset["file_name"]
-
-        if not file_path.is_file():
-            raise HTTPException(
-                status_code=404,
-                detail="Dataset file not found.",
-            )
-
-        # ----------------------------------------------------
-        # Load dataset
+               # ----------------------------------------------------
+        # Load dataset from Blob or legacy local storage
         # ----------------------------------------------------
 
-        if dataset["file_type"] == "csv":
-            dataframe = pd.read_csv(file_path)
-
-        elif dataset["file_type"] in {"xlsx", "xls"}:
-            dataframe = pd.read_excel(file_path)
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type.",
-            )
-
+        dataframe = load_dataset_dataframe(dataset)
         # ----------------------------------------------------
         # Validate dataset
         # ----------------------------------------------------
@@ -575,27 +804,8 @@ def execute_dataset_analysis(
                 detail="Dataset not found.",
             )
 
-        file_path = UPLOAD_DIR / dataset["file_name"]
-
-        if not file_path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail="Dataset file not found.",
-            )
-
-        # Load the dataset.
-        if dataset["file_type"] == "csv":
-            dataframe = pd.read_csv(file_path)
-
-        elif dataset["file_type"] in {"xlsx", "xls"}:
-            dataframe = pd.read_excel(file_path)
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type.",
-            )
-
+                # Load the dataset from Blob or legacy local storage.
+        dataframe = load_dataset_dataframe(dataset)
         # Build the analysis plan.
         plan = plan_analysis(request.question)
 
@@ -680,25 +890,8 @@ def analyze_dataset(
                 detail="Dataset not found.",
             )
 
-        file_path = UPLOAD_DIR / dataset["file_name"]
-
-        if not file_path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail="Dataset file not found.",
-            )
-
-        if dataset["file_type"] == "csv":
-            dataframe = pd.read_csv(file_path)
-
-        elif dataset["file_type"] in {"xlsx", "xls"}:
-            dataframe = pd.read_excel(file_path)
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type.",
-            )
+                # Load the dataset from Blob or legacy local storage.
+        dataframe = load_dataset_dataframe(dataset)
 
         # ----------------------------------------------------
         # Deterministic analysis
@@ -1097,25 +1290,8 @@ def get_dataset_anomalies(
                 detail="Dataset not found.",
             )
 
-        file_path = UPLOAD_DIR / dataset["file_name"]
-
-        if not file_path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail="Dataset file not found.",
-            )
-
-        if dataset["file_type"] == "csv":
-            dataframe = pd.read_csv(file_path)
-
-        elif dataset["file_type"] in {"xlsx", "xls"}:
-            dataframe = pd.read_excel(file_path)
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type.",
-            )
+                # Load the dataset from Blob or legacy local storage.
+        dataframe = load_dataset_dataframe(dataset)
 
         anomalies = detect_anomalies(
             dataframe,
@@ -1169,29 +1345,8 @@ def get_dataset_intelligence(
                 detail="Dataset not found.",
             )
 
-        file_path = UPLOAD_DIR / dataset["file_name"]
-
-        if not file_path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail="Dataset file not found.",
-            )
-
-        # ----------------------------------------------------
-        # Load dataset
-        # ----------------------------------------------------
-
-        if dataset["file_type"] == "csv":
-            dataframe = pd.read_csv(file_path)
-
-        elif dataset["file_type"] in {"xlsx", "xls"}:
-            dataframe = pd.read_excel(file_path)
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type.",
-            )
+                # Load the dataset from Blob or legacy local storage.
+        dataframe = load_dataset_dataframe(dataset)
 
         # ----------------------------------------------------
         # Validate dataset
@@ -1290,27 +1445,11 @@ def download_dataset_pdf_report(dataset_id: int):
         # Load dataset file
         # ----------------------------------------------------
 
-        file_path = UPLOAD_DIR / dataset_row["file_name"]
+                # ----------------------------------------------------
+        # Load dataset from Blob or legacy local storage
+        # ----------------------------------------------------
 
-        if not file_path.is_file():
-            raise HTTPException(
-                status_code=404,
-                detail="Dataset file not found.",
-            )
-
-        file_type = dataset_row["file_type"]
-
-        if file_type == "csv":
-            dataframe = pd.read_csv(file_path)
-
-        elif file_type in {"xlsx", "xls"}:
-            dataframe = pd.read_excel(file_path)
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type.",
-            )
+        dataframe = load_dataset_dataframe(dataset_row)
 
         # ----------------------------------------------------
         # Generate validation metrics
@@ -1516,25 +1655,11 @@ def ask_business_question(
                 detail="Question is required.",
             )
 
-        file_path = UPLOAD_DIR / dataset["file_name"]
+                # ----------------------------------------------------
+        # Load dataset from Blob or legacy local storage
+        # ----------------------------------------------------
 
-        if not file_path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail="Dataset file not found.",
-            )
-
-        if dataset["file_type"] == "csv":
-            dataframe = pd.read_csv(file_path)
-
-        elif dataset["file_type"] in {"xlsx", "xls"}:
-            dataframe = pd.read_excel(file_path)
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type.",
-            )
+        dataframe = load_dataset_dataframe(dataset)
 
         result = answer_business_question(
             dataframe,
@@ -1601,30 +1726,11 @@ def visualize_dataset(
                 detail="Dataset not found.",
             )
 
-        file_path = UPLOAD_DIR / dataset["file_name"]
-
-        if not file_path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail="Dataset file not found.",
-            )
-
-        # ----------------------------------------------------
-        # Load dataset
+               # ----------------------------------------------------
+        # Load dataset from Blob or legacy local storage
         # ----------------------------------------------------
 
-        if dataset["file_type"] == "csv":
-            dataframe = pd.read_csv(file_path)
-
-        elif dataset["file_type"] in {"xlsx", "xls"}:
-            dataframe = pd.read_excel(file_path)
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type.",
-            )
-
+        dataframe = load_dataset_dataframe(dataset)
         # ----------------------------------------------------
         # Complete visualization pipeline
         # ----------------------------------------------------

@@ -38,3 +38,13 @@ dataset_*_report.pdf
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local database backups
+backend/database.py.sqlite-backup
+database/*.sqlite-backup.db
+
+# Vercel local configuration
+.vercel/
+
+# Node.js dependencies
+node_modules/

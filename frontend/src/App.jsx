@@ -344,24 +344,82 @@ setSelectedAnomaly(null);
     setSortOrder("desc");
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
+            // =========================
+      // DIRECT PRIVATE BLOB UPLOAD
+      // =========================
 
-      const uploadResponse = await fetch(
-        `${API_BASE_URL}/upload`,
+      // Step 1: Request a secure upload URL.
+      const uploadUrlResponse = await fetch("/api/upload-url", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          fileName: file.name,
+          fileSize: file.size,
+        }),
+      });
+
+      const uploadUrlData = await uploadUrlResponse.json();
+
+      if (!uploadUrlResponse.ok) {
+        throw new Error(
+          uploadUrlData.error ||
+            "Could not prepare the secure file upload."
+        );
+      }
+
+      if (
+        !uploadUrlData.presignedUrl ||
+        !uploadUrlData.pathname ||
+        !uploadUrlData.contentType
+      ) {
+        throw new Error("The secure upload URL response is incomplete.");
+      }
+
+      // Step 2: Upload the file directly to Vercel Blob.
+      const blobUploadResponse = await fetch(
+        uploadUrlData.presignedUrl,
         {
-          method: "POST",
-          body: formData,
+          method: "PUT",
+          headers: {
+            "Content-Type": uploadUrlData.contentType,
+          },
+          body: file,
         }
       );
 
-      const uploadData = await uploadResponse.json();
+      if (!blobUploadResponse.ok) {
+        throw new Error(
+          "Direct file upload failed. Please try again."
+        );
+      }
 
-      if (!uploadResponse.ok) {
+      // Step 3: Register the uploaded file with the backend.
+      const registrationResponse = await fetch(
+        `${API_BASE_URL}/upload/register`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+  pathname: uploadUrlData.pathname,
+  fileName: file.name,
+  fileSize: file.size,
+  contentType: uploadUrlData.contentType,
+  registrationToken: uploadUrlData.registrationToken,
+}),
+        }
+      );
+
+      const uploadData = await registrationResponse.json();
+
+      if (!registrationResponse.ok) {
         throw new Error(
           uploadData.detail ||
             uploadData.error ||
-            "Dataset upload failed."
+            "Dataset registration failed."
         );
       }
 
