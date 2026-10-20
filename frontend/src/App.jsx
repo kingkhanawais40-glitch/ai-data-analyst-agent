@@ -534,10 +534,8 @@ setSelectedAnomaly(null);
   useEffect(() => {
     const restoreDataset = async () => {
       try {
-        // Dataset #20 is already stored in the backend.
-        // We restore it without creating a new snapshot.
-        const restoredDatasetId = 20;
-
+        // Production dataset ID
+const restoredDatasetId = 3;
         setUploading(true);
         setError("");
 
