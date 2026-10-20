@@ -600,6 +600,26 @@ const restoredDatasetId = 3;
         setHistory(historyData);
 
         // =========================
+// RESTORE AI INTELLIGENCE
+// =========================
+
+const intelligenceResponse = await fetch(
+  `${API_BASE_URL}/datasets/${restoredDatasetId}/intelligence`
+);
+
+if (!intelligenceResponse.ok) {
+  throw new Error(
+    "AI intelligence could not be restored."
+  );
+}
+
+const intelligenceData = await intelligenceResponse.json();
+
+setIntelligence(
+  intelligenceData.intelligence || null
+);
+
+        // =========================
         // RESTORE VALIDATION DATA
         // =========================
         //
